@@ -115,6 +115,7 @@ COMMANDS:
                 (Security Group -> EC2 Instance -> S3 Bucket)
 
     destroy     Clean up all resources (uses state file for accuracy)
+                Add --backend flag to also destroy the S3 state backend
 
     plan        Preview what would be created or destroyed
                 (same as apply/destroy with --dry-run)
@@ -123,12 +124,20 @@ COMMANDS:
 
     verify      Check that created resources exist and are accessible
 
+    state       Manage state backend
+                  init    - Initialize S3 backend (create bucket)
+                  pull    - Pull state from S3 to local
+                  push    - Push local state to S3
+                  unlock  - Force unlock remote state
+                  status  - Show backend status
+
     help        Show this help message
 
 OPTIONS:
     --auto-approve    Skip all confirmation prompts
     --verbose, -v     Enable debug logging (LOG_LEVEL=DEBUG)
     --dry-run         Show actions without executing them
+    --backend         For destroy: also destroy S3 state backend
     --help, -h        Show this help message
 
 ENVIRONMENT VARIABLES:
@@ -136,6 +145,8 @@ ENVIRONMENT VARIABLES:
     AWS_PROFILE       AWS CLI profile to use (default: default)
     AUTO_APPROVE      Set to 'true' to skip prompts
     LOG_LEVEL         Logging level: DEBUG, INFO, WARN, ERROR
+    STATE_BACKEND     State backend: 'local' or 's3' (default: local)
+    STATE_S3_BUCKET   S3 bucket for remote state (auto-created if empty)
 
 EXAMPLES:
     # Create all resources interactively
@@ -156,6 +167,15 @@ EXAMPLES:
     # Clean up everything
     ./orchestrate.sh destroy
 
+    # Use S3 remote state backend
+    STATE_BACKEND=s3 ./orchestrate.sh apply
+
+    # Initialize S3 backend manually
+    STATE_BACKEND=s3 ./orchestrate.sh state init
+
+    # Destroy resources AND the state backend
+    STATE_BACKEND=s3 ./orchestrate.sh destroy --backend
+
 FAILURE RECOVERY:
     If apply fails mid-way:
     1. Check status:  ./orchestrate.sh status
@@ -169,6 +189,7 @@ For more information, see README.md
 
 EOF
 }
+        state_backend_init || exit 1
 
 # ============================================================================
 # Command: Apply (Create Resources)
@@ -182,10 +203,15 @@ cmd_apply() {
     log_kv "Region" "${AWS_REGION}"
     log_kv "Profile" "${AWS_PROFILE}"
     log_kv "Project Tag" "${PROJECT_TAG}"
+    log_kv "State Backend" "${STATE_BACKEND:-local}"
     log_separator "="
     echo ""
     
-    # Initialize state
+    # Initialize state (with S3 backend if configured)
+    if state_is_s3_backend; then
+        state_lock_remote || exit 1
+        state_pull || exit 1
+    fi
     state_init
     
     # Confirmation
@@ -269,6 +295,12 @@ cmd_apply() {
     # Mark apply as complete (prevent failure handler from running)
     APPLY_IN_PROGRESS=false
     
+    # Push state to S3 and release lock
+    if state_is_s3_backend; then
+        state_push || log_warn "Failed to push state to S3"
+        state_unlock_remote
+    fi
+    
     # Final summary
     log_separator "="
     log_success "All resources created successfully!"
@@ -297,9 +329,32 @@ cmd_apply() {
 cmd_destroy() {
     log_info "Starting resource cleanup..."
     
+    # If using S3 backend, pull latest state first
+    if state_is_s3_backend; then
+        state_lock_remote || exit 1
+        state_pull || exit 1
+    fi
+    
     if ! bash "${SCRIPTS_DIR}/cleanup_resources.sh"; then
         log_error "Cleanup failed or was cancelled"
+        state_unlock_remote 2>/dev/null || true
         exit 1
+    fi
+    
+    # Push cleared state and unlock
+    if state_is_s3_backend; then
+        state_push || true
+        state_unlock_remote
+    fi
+    
+    # Destroy backend if requested
+    if [[ "${DESTROY_BACKEND:-false}" == "true" ]]; then
+        echo ""
+        log_warn "Destroying S3 state backend..."
+        state_backend_destroy || {
+            log_error "Failed to destroy state backend"
+            exit 1
+        }
     fi
 }
 
@@ -523,33 +578,115 @@ cmd_verify() {
 }
 
 # ============================================================================
+# Command: State (Manage State Backend)
+# ============================================================================
+
+cmd_state() {
+    local subcommand="${SUBCOMMAND:-status}"
+    
+    case "${subcommand}" in
+        init)
+            log_info "Initializing state backend..."
+            if ! state_is_s3_backend; then
+                log_warn "STATE_BACKEND is not set to 's3'"
+                log_info "Set STATE_BACKEND=s3 to use S3 remote state"
+                log_info "Initializing local state only..."
+                state_init
+            else
+                state_backend_init || exit 1
+                state_init
+                state_push || exit 1
+                log_success "S3 state backend initialized and ready"
+            fi
+            ;;
+        pull)
+            if ! state_is_s3_backend; then
+                log_error "S3 backend not enabled. Set STATE_BACKEND=s3"
+                exit 1
+            fi
+            state_pull || exit 1
+            ;;
+        push)
+            if ! state_is_s3_backend; then
+                log_error "S3 backend not enabled. Set STATE_BACKEND=s3"
+                exit 1
+            fi
+            state_push || exit 1
+            ;;
+        unlock)
+            log_warn "Force unlocking state..."
+            state_force_unlock
+            ;;
+        status)
+            echo ""
+            echo "========================================"
+            echo " State Backend Status"
+            echo "========================================"
+            state_backend_status
+            echo "========================================"
+            echo ""
+            ;;
+        *)
+            log_error "Unknown state subcommand: ${subcommand}"
+            echo ""
+            echo "Usage: ./orchestrate.sh state <subcommand>"
+            echo ""
+            echo "Subcommands:"
+            echo "  init    - Initialize S3 backend (create bucket)"
+            echo "  pull    - Pull state from S3 to local"
+            echo "  push    - Push local state to S3"
+            echo "  unlock  - Force unlock remote state"
+            echo "  status  - Show backend status"
+            exit 1
+            ;;
+    esac
+}
+
+# ============================================================================
 # Argument Parsing
 # ============================================================================
 
 parse_args() {
-    local command=""
+    # Parse arguments and set global variables
+    # Sets: COMMAND, SUBCOMMAND, AUTO_APPROVE, LOG_LEVEL, VERBOSE, DRY_RUN, DESTROY_BACKEND
+    COMMAND=""
+    SUBCOMMAND=""
+    DESTROY_BACKEND="false"
     
     while [[ $# -gt 0 ]]; do
         case "$1" in
             apply|destroy|plan|status|verify|help)
-                command="$1"
+                COMMAND="$1"
                 shift
                 ;;
+            state)
+                COMMAND="state"
+                shift
+                # Get subcommand if present
+                if [[ $# -gt 0 ]] && [[ ! "$1" =~ ^-- ]]; then
+                    SUBCOMMAND="$1"
+                    shift
+                fi
+                ;;
             --auto-approve)
-                export AUTO_APPROVE="true"
+                AUTO_APPROVE="true"
                 shift
                 ;;
             --verbose|-v)
-                export LOG_LEVEL="DEBUG"
-                export VERBOSE="true"
+                LOG_LEVEL="DEBUG"
+                VERBOSE="true"
                 shift
                 ;;
             --dry-run)
-                export DRY_RUN="true"
+                DRY_RUN="true"
+                shift
+                ;;
+            --backend)
+                DESTROY_BACKEND="true"
                 shift
                 ;;
             --help|-h)
-                command="help"
+                COMMAND="help"
                 shift
                 ;;
             *)
@@ -561,11 +698,9 @@ parse_args() {
     done
     
     # Default to help if no command given
-    if [[ -z "${command}" ]]; then
-        command="help"
+    if [[ -z "${COMMAND}" ]]; then
+        COMMAND="help"
     fi
-    
-    echo "${command}"
 }
 
 # ============================================================================
@@ -573,10 +708,10 @@ parse_args() {
 # ============================================================================
 
 main() {
-    local command
-    command=$(parse_args "$@")
+    # Parse args - sets global COMMAND and flag variables
+    parse_args "$@"
     
-    case "${command}" in
+    case "${COMMAND}" in
         apply)
             cmd_apply
             ;;
@@ -592,11 +727,14 @@ main() {
         verify)
             cmd_verify
             ;;
+        state)
+            cmd_state
+            ;;
         help)
             show_help
             ;;
         *)
-            log_error "Unknown command: ${command}"
+            log_error "Unknown command: ${COMMAND}"
             show_help
             exit 1
             ;;

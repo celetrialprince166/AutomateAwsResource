@@ -223,35 +223,93 @@ state_set_resource() {
         
         _state_write_atomic "${new_state}"
     else
-        # Fallback without jq - use sed for basic JSON manipulation
-        log_warn "jq not available - using sed-based state update"
+        # Fallback without jq - use sed/awk for basic JSON manipulation
+        log_debug "jq not available - using text-based state update"
         
         if [[ -f "${STATE_FILE}" ]]; then
-            # Escape the resource data for sed (escape special chars)
-            local escaped_data
-            escaped_data=$(echo "${resource_data}" | sed 's/[&/\]/\\&/g' | tr -d '\n')
-            
-            # Use sed to replace the resource value
-            # Pattern: "resource_type": null or "resource_type": {...}
             local temp_file="${STATE_FILE}.tmp.$$"
             
-            # First try to replace null with the new data
-            sed "s/\"${resource_type}\": *null/\"${resource_type}\": ${escaped_data}/" "${STATE_FILE}" > "${temp_file}"
+            # Read current state
+            local current_content
+            current_content=$(cat "${STATE_FILE}")
             
-            # If the pattern wasn't null, try to replace existing object
-            # This is a simple approach - just replace the line
-            if grep -q "\"${resource_type}\": *null" "${STATE_FILE}"; then
-                mv "${temp_file}" "${STATE_FILE}"
+            # Check if resources section is empty: "resources": {}
+            if echo "${current_content}" | grep -q '"resources": *{}'; then
+                # Empty resources - insert new resource
+                # Replace "resources": {} with "resources": { "type": data }
+                local insert_data
+                insert_data=$(printf '  "resources": {\n    "%s": %s\n  }' "${resource_type}" "${resource_data}")
+                
+                # Use awk to replace the empty resources block
+                awk -v new_block="${insert_data}" '
+                    /"resources": *\{\}/ { 
+                        print new_block
+                        next 
+                    }
+                    { print }
+                ' "${STATE_FILE}" > "${temp_file}"
+                
+            elif echo "${current_content}" | grep -q "\"${resource_type}\":"; then
+                # Resource exists - update it
+                # This is complex without jq, so we rebuild the resources section
+                log_debug "Updating existing resource ${resource_type}"
+                
+                # For simplicity, read existing resources and rebuild
+                awk -v type="${resource_type}" -v data="${resource_data}" '
+                    BEGIN { in_resources = 0; done = 0 }
+                    /"resources": *\{/ { 
+                        in_resources = 1 
+                        print
+                        next
+                    }
+                    in_resources && /^  *\}/ && !done {
+                        # End of resources block - we handled it
+                        in_resources = 0
+                        print
+                        next
+                    }
+                    in_resources && match($0, "\"" type "\":") {
+                        # Found our resource type - replace the line
+                        # Handle multi-line by skipping until we close the brace
+                        printf "    \"%s\": %s", type, data
+                        # Check if this line has closing brace
+                        if (match($0, /\}[,]? *$/)) {
+                            if (match($0, /,$/)) print ","
+                            else print ""
+                        } else {
+                            # Multi-line object - skip until closing
+                            brace = 1
+                            while (brace > 0 && (getline line) > 0) {
+                                brace += gsub(/\{/, "{", line) - gsub(/\}/, "}", line)
+                            }
+                            if (match(line, /,$/)) print ","
+                            else print ""
+                        }
+                        done = 1
+                        next
+                    }
+                    { print }
+                ' "${STATE_FILE}" > "${temp_file}"
             else
-                # Resource already has a value, need more complex replacement
-                # For now, just use the temp file approach
-                mv "${temp_file}" "${STATE_FILE}"
+                # Resource doesn't exist - add it to resources block
+                # Find "resources": { and add new entry
+                awk -v type="${resource_type}" -v data="${resource_data}" '
+                    /"resources": *\{/ { 
+                        print
+                        printf "    \"%s\": %s,\n", type, data
+                        next
+                    }
+                    { print }
+                ' "${STATE_FILE}" > "${temp_file}"
             fi
+            
+            # Move temp file to state file
+            mv "${temp_file}" "${STATE_FILE}"
             
             # Update timestamp
             sed -i "s/\"updated_at\": *\"[^\"]*\"/\"updated_at\": \"${timestamp}\"/" "${STATE_FILE}"
             
-            log_debug "State updated via sed for ${resource_type}"
+            log_debug "State updated via text parsing for ${resource_type}"
         else
             log_error "State file not found for update"
             state_unlock
@@ -603,5 +661,495 @@ state_s3_json() {
   "created_at": "${timestamp}"
 }
 EOF
+}
+
+# ============================================================================
+# S3 Remote State Backend
+# ============================================================================
+#
+# Provides remote state storage in S3 with:
+#   - Automatic bucket creation with versioning
+#   - Server-side encryption (SSE-S3)
+#   - Simple locking via S3 object metadata
+#   - Pull/push operations for state synchronization
+#
+
+# Get the state bucket name (auto-generate if not set)
+_state_get_s3_bucket() {
+    if [[ -n "${STATE_S3_BUCKET:-}" ]]; then
+        echo "${STATE_S3_BUCKET}"
+        return 0
+    fi
+    
+    # Auto-generate bucket name using account ID
+    local account_id
+    account_id=$(aws sts get-caller-identity --query 'Account' --output text 2>/dev/null | tr -d '\r\n' || echo "")
+    
+    if [[ -z "${account_id}" ]]; then
+        log_error "Cannot determine AWS account ID for state bucket name"
+        return 1
+    fi
+    
+    echo "${NAME_PREFIX:-automationlab}-tfstate-${account_id}"
+}
+
+# Check if S3 backend is enabled
+state_is_s3_backend() {
+    [[ "${STATE_BACKEND:-local}" == "s3" ]]
+}
+
+# Initialize S3 backend - create bucket if needed
+# Usage: state_backend_init
+state_backend_init() {
+    if ! state_is_s3_backend; then
+        log_debug "S3 backend not enabled, skipping initialization"
+        return 0
+    fi
+    
+    local bucket_name
+    bucket_name=$(_state_get_s3_bucket) || return 1
+    local region="${STATE_S3_REGION:-${AWS_REGION:-eu-west-1}}"
+    
+    log_info "Initializing S3 state backend..."
+    log_info "  Bucket: ${bucket_name}"
+    log_info "  Region: ${region}"
+    log_info "  Key: ${STATE_S3_KEY}"
+    
+    # Check if bucket exists
+    if aws s3api head-bucket --bucket "${bucket_name}" 2>/dev/null; then
+        log_info "State bucket already exists: ${bucket_name}"
+    else
+        log_info "Creating state bucket: ${bucket_name}"
+        
+        # Create bucket (handle us-east-1 special case)
+        if [[ "${region}" == "us-east-1" ]]; then
+            aws s3api create-bucket \
+                --bucket "${bucket_name}" \
+                --region "${region}" || {
+                log_error "Failed to create state bucket"
+                return 1
+            }
+        else
+            aws s3api create-bucket \
+                --bucket "${bucket_name}" \
+                --region "${region}" \
+                --create-bucket-configuration LocationConstraint="${region}" || {
+                log_error "Failed to create state bucket"
+                return 1
+            }
+        fi
+        
+        log_success "State bucket created: ${bucket_name}"
+    fi
+    
+    # Enable versioning
+    log_debug "Enabling versioning on state bucket..."
+    aws s3api put-bucket-versioning \
+        --bucket "${bucket_name}" \
+        --versioning-configuration Status=Enabled || {
+        log_warn "Failed to enable versioning on state bucket"
+    }
+    
+    # Enable server-side encryption (SSE-S3)
+    if [[ "${STATE_S3_ENCRYPT:-true}" == "true" ]]; then
+        log_debug "Enabling server-side encryption..."
+        aws s3api put-bucket-encryption \
+            --bucket "${bucket_name}" \
+            --server-side-encryption-configuration '{
+                "Rules": [{
+                    "ApplyServerSideEncryptionByDefault": {
+                        "SSEAlgorithm": "AES256"
+                    }
+                }]
+            }' 2>/dev/null || log_debug "Encryption may already be configured"
+    fi
+    
+    # Block public access (state should never be public)
+    log_debug "Blocking public access to state bucket..."
+    aws s3api put-public-access-block \
+        --bucket "${bucket_name}" \
+        --public-access-block-configuration '{
+            "BlockPublicAcls": true,
+            "IgnorePublicAcls": true,
+            "BlockPublicPolicy": true,
+            "RestrictPublicBuckets": true
+        }' 2>/dev/null || log_debug "Public access block may already be configured"
+    
+    # Tag the bucket
+    aws s3api put-bucket-tagging \
+        --bucket "${bucket_name}" \
+        --tagging "TagSet=[{Key=${TAG_KEY:-Project},Value=${PROJECT_TAG:-AutomationLab}},{Key=Purpose,Value=TerraformState}]" \
+        2>/dev/null || true
+    
+    # Export bucket name for other functions
+    export STATE_S3_BUCKET="${bucket_name}"
+    
+    log_success "S3 state backend initialized"
+    return 0
+}
+
+# Acquire remote lock using S3 object metadata
+# Uses a separate lock object in S3
+state_lock_remote() {
+    if ! state_is_s3_backend; then
+        return 0
+    fi
+    
+    local bucket_name
+    bucket_name=$(_state_get_s3_bucket) || return 1
+    local lock_key="${STATE_S3_KEY}.lock"
+    local timeout="${STATE_LOCK_TIMEOUT:-60}"
+    local waited=0
+    local lock_holder=""
+    
+    log_debug "Acquiring remote state lock: s3://${bucket_name}/${lock_key}"
+    
+    # Check for existing lock
+    while true; do
+        # Try to get lock info
+        lock_holder=$(aws s3api head-object \
+            --bucket "${bucket_name}" \
+            --key "${lock_key}" \
+            --query 'Metadata.lockholder' \
+            --output text 2>/dev/null || echo "")
+        
+        if [[ -z "${lock_holder}" ]] || [[ "${lock_holder}" == "None" ]]; then
+            # No lock exists, try to acquire
+            break
+        fi
+        
+        # Check lock age via LastModified
+        local lock_time
+        lock_time=$(aws s3api head-object \
+            --bucket "${bucket_name}" \
+            --key "${lock_key}" \
+            --query 'LastModified' \
+            --output text 2>/dev/null || echo "")
+        
+        if [[ -n "${lock_time}" ]]; then
+            local lock_epoch
+            lock_epoch=$(date -d "${lock_time}" +%s 2>/dev/null || date -j -f "%Y-%m-%dT%H:%M:%S" "${lock_time%%.*}" +%s 2>/dev/null || echo 0)
+            local now_epoch
+            now_epoch=$(date +%s)
+            local lock_age=$((now_epoch - lock_epoch))
+            
+            if [[ ${lock_age} -gt ${timeout} ]]; then
+                log_warn "Stale remote lock detected (${lock_age}s old), removing..."
+                aws s3 rm "s3://${bucket_name}/${lock_key}" 2>/dev/null || true
+                break
+            fi
+        fi
+        
+        if [[ ${waited} -ge ${timeout} ]]; then
+            log_error "Failed to acquire remote state lock after ${timeout}s"
+            log_error "Lock held by: ${lock_holder}"
+            log_error "To force unlock: ./orchestrate.sh state unlock"
+            return 1
+        fi
+        
+        log_debug "Waiting for remote state lock... (${waited}s, held by: ${lock_holder})"
+        sleep 2
+        waited=$((waited + 2))
+    done
+    
+    # Create lock object with metadata
+    local hostname
+    hostname=$(hostname 2>/dev/null || echo "unknown")
+    local lock_info="pid=$$,host=${hostname},time=$(date -Iseconds)"
+    
+    echo "Lock acquired by ${lock_info}" | aws s3 cp - "s3://${bucket_name}/${lock_key}" \
+        --metadata "lockholder=${lock_info}" \
+        --content-type "text/plain" 2>/dev/null || {
+        log_error "Failed to create remote lock"
+        return 1
+    }
+    
+    log_debug "Remote state lock acquired"
+    return 0
+}
+
+# Release remote lock
+state_unlock_remote() {
+    if ! state_is_s3_backend; then
+        return 0
+    fi
+    
+    local bucket_name
+    bucket_name=$(_state_get_s3_bucket) || return 1
+    local lock_key="${STATE_S3_KEY}.lock"
+    
+    log_debug "Releasing remote state lock..."
+    aws s3 rm "s3://${bucket_name}/${lock_key}" 2>/dev/null || true
+    log_debug "Remote state lock released"
+}
+
+# Force unlock remote state (for recovery)
+state_force_unlock() {
+    if ! state_is_s3_backend; then
+        log_info "Not using S3 backend, removing local lock only"
+        state_unlock
+        return 0
+    fi
+    
+    local bucket_name
+    bucket_name=$(_state_get_s3_bucket) || return 1
+    local lock_key="${STATE_S3_KEY}.lock"
+    
+    log_warn "Force unlocking remote state..."
+    
+    # Show current lock holder
+    local lock_holder
+    lock_holder=$(aws s3api head-object \
+        --bucket "${bucket_name}" \
+        --key "${lock_key}" \
+        --query 'Metadata.lockholder' \
+        --output text 2>/dev/null || echo "none")
+    
+    if [[ "${lock_holder}" != "none" ]] && [[ "${lock_holder}" != "None" ]]; then
+        log_info "Current lock holder: ${lock_holder}"
+    fi
+    
+    aws s3 rm "s3://${bucket_name}/${lock_key}" 2>/dev/null || true
+    state_unlock  # Also remove local lock
+    
+    log_success "State lock forcefully released"
+}
+
+# Pull state from S3 to local cache
+# Usage: state_pull
+state_pull() {
+    if ! state_is_s3_backend; then
+        log_debug "S3 backend not enabled, skipping pull"
+        return 0
+    fi
+    
+    local bucket_name
+    bucket_name=$(_state_get_s3_bucket) || return 1
+    local s3_key="${STATE_S3_KEY}"
+    
+    log_info "Pulling state from S3..."
+    log_debug "  Source: s3://${bucket_name}/${s3_key}"
+    log_debug "  Dest: ${STATE_FILE}"
+    
+    # Ensure local state directory exists
+    mkdir -p "${STATE_DIR}" 2>/dev/null || true
+    
+    # Check if remote state exists
+    if ! aws s3api head-object --bucket "${bucket_name}" --key "${s3_key}" &>/dev/null; then
+        log_info "No remote state found, will create on first push"
+        return 0
+    fi
+    
+    # Download state
+    aws s3 cp "s3://${bucket_name}/${s3_key}" "${STATE_FILE}" --quiet || {
+        log_error "Failed to pull state from S3"
+        return 1
+    }
+    
+    log_success "State pulled from S3"
+    return 0
+}
+
+# Push local state to S3
+# Usage: state_push
+state_push() {
+    if ! state_is_s3_backend; then
+        log_debug "S3 backend not enabled, skipping push"
+        return 0
+    fi
+    
+    local bucket_name
+    bucket_name=$(_state_get_s3_bucket) || return 1
+    local s3_key="${STATE_S3_KEY}"
+    
+    if [[ ! -f "${STATE_FILE}" ]]; then
+        log_warn "No local state file to push"
+        return 0
+    fi
+    
+    log_info "Pushing state to S3..."
+    log_debug "  Source: ${STATE_FILE}"
+    log_debug "  Dest: s3://${bucket_name}/${s3_key}"
+    
+    # Upload state with server-side encryption
+    local extra_args=""
+    if [[ "${STATE_S3_ENCRYPT:-true}" == "true" ]]; then
+        extra_args="--sse AES256"
+    fi
+    
+    aws s3 cp "${STATE_FILE}" "s3://${bucket_name}/${s3_key}" \
+        --content-type "application/json" \
+        ${extra_args} --quiet || {
+        log_error "Failed to push state to S3"
+        return 1
+    }
+    
+    log_success "State pushed to S3"
+    return 0
+}
+
+# Destroy S3 state backend (bucket and contents)
+# Usage: state_backend_destroy [--force]
+state_backend_destroy() {
+    local force="${1:-}"
+    
+    if ! state_is_s3_backend; then
+        log_warn "S3 backend not enabled"
+        return 0
+    fi
+    
+    local bucket_name
+    bucket_name=$(_state_get_s3_bucket) || return 1
+    
+    # Check if bucket exists
+    if ! aws s3api head-bucket --bucket "${bucket_name}" 2>/dev/null; then
+        log_info "State bucket does not exist: ${bucket_name}"
+        return 0
+    fi
+    
+    log_warn "This will PERMANENTLY DELETE the state bucket and ALL state history!"
+    log_warn "Bucket: ${bucket_name}"
+    
+    if [[ "${force}" != "--force" ]] && [[ "${AUTO_APPROVE:-false}" != "true" ]]; then
+        echo ""
+        read -r -p "Type 'destroy-backend' to confirm: " confirm
+        if [[ "${confirm}" != "destroy-backend" ]]; then
+            log_info "Backend destruction cancelled"
+            return 0
+        fi
+    fi
+    
+    log_info "Destroying S3 state backend..."
+    
+    # Delete all object versions (required for versioned buckets)
+    log_debug "Deleting all object versions..."
+    
+    # Delete versions
+    local versions
+    versions=$(aws s3api list-object-versions \
+        --bucket "${bucket_name}" \
+        --query 'Versions[*].[Key,VersionId]' \
+        --output text 2>/dev/null || echo "")
+    
+    if [[ -n "${versions}" ]]; then
+        while IFS=$'\t' read -r key version_id; do
+            if [[ -n "${key}" ]] && [[ -n "${version_id}" ]] && [[ "${key}" != "None" ]]; then
+                aws s3api delete-object \
+                    --bucket "${bucket_name}" \
+                    --key "${key}" \
+                    --version-id "${version_id}" >/dev/null 2>&1 || true
+            fi
+        done <<< "${versions}"
+    fi
+    
+    # Delete delete markers
+    local markers
+    markers=$(aws s3api list-object-versions \
+        --bucket "${bucket_name}" \
+        --query 'DeleteMarkers[*].[Key,VersionId]' \
+        --output text 2>/dev/null || echo "")
+    
+    if [[ -n "${markers}" ]]; then
+        while IFS=$'\t' read -r key version_id; do
+            if [[ -n "${key}" ]] && [[ -n "${version_id}" ]] && [[ "${key}" != "None" ]]; then
+                aws s3api delete-object \
+                    --bucket "${bucket_name}" \
+                    --key "${key}" \
+                    --version-id "${version_id}" >/dev/null 2>&1 || true
+            fi
+        done <<< "${markers}"
+    fi
+    
+    # Delete bucket
+    log_debug "Deleting bucket..."
+    aws s3 rb "s3://${bucket_name}" --force 2>/dev/null || {
+        log_error "Failed to delete state bucket"
+        return 1
+    }
+    
+    log_success "S3 state backend destroyed: ${bucket_name}"
+    return 0
+}
+
+# Show S3 backend status
+state_backend_status() {
+    if ! state_is_s3_backend; then
+        echo "Backend: local"
+        echo "State file: ${STATE_FILE}"
+        return 0
+    fi
+    
+    local bucket_name
+    bucket_name=$(_state_get_s3_bucket) || {
+        echo "Backend: s3 (not configured)"
+        return 1
+    }
+    
+    echo "Backend: s3"
+    echo "Bucket: ${bucket_name}"
+    echo "Key: ${STATE_S3_KEY}"
+    echo "Region: ${STATE_S3_REGION:-${AWS_REGION}}"
+    echo "Encryption: ${STATE_S3_ENCRYPT:-true}"
+    echo ""
+    
+    # Check bucket status
+    if aws s3api head-bucket --bucket "${bucket_name}" 2>/dev/null; then
+        echo "Bucket Status: EXISTS"
+        
+        # Check for lock
+        local lock_key="${STATE_S3_KEY}.lock"
+        local lock_holder
+        lock_holder=$(aws s3api head-object \
+            --bucket "${bucket_name}" \
+            --key "${lock_key}" \
+            --query 'Metadata.lockholder' \
+            --output text 2>/dev/null || echo "")
+        
+        if [[ -n "${lock_holder}" ]] && [[ "${lock_holder}" != "None" ]]; then
+            echo "Lock Status: LOCKED by ${lock_holder}"
+        else
+            echo "Lock Status: UNLOCKED"
+        fi
+        
+        # Check state file
+        if aws s3api head-object --bucket "${bucket_name}" --key "${STATE_S3_KEY}" &>/dev/null; then
+            local last_modified
+            last_modified=$(aws s3api head-object \
+                --bucket "${bucket_name}" \
+                --key "${STATE_S3_KEY}" \
+                --query 'LastModified' \
+                --output text 2>/dev/null || echo "unknown")
+            echo "State File: EXISTS (modified: ${last_modified})"
+        else
+            echo "State File: NOT FOUND"
+        fi
+    else
+        echo "Bucket Status: DOES NOT EXIST"
+    fi
+}
+
+# Wrapper for state_init that handles S3 backend
+# Call this instead of state_init directly
+state_init_with_backend() {
+    # Initialize S3 backend if enabled
+    if state_is_s3_backend; then
+        state_backend_init || return 1
+        state_lock_remote || return 1
+        state_pull || return 1
+    fi
+    
+    # Initialize local state
+    state_init
+    
+    return 0
+}
+
+# Wrapper for state operations that syncs with S3
+# Call this after any state modification
+state_sync() {
+    if state_is_s3_backend; then
+        state_push || return 1
+    fi
+    return 0
 }
 

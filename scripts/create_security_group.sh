@@ -84,13 +84,16 @@ find_existing_sg() {
     local sg_name="$1"
     local vpc_id="$2"
     
-    log_debug "Checking for existing security group: ${sg_name} in VPC ${vpc_id}"
+    log_debug "Checking for existing security group: ${sg_name} in VPC ${vpc_id}" >&2
     
     local sg_id
     sg_id=$(aws_cmd ec2 describe-security-groups \
         --filters "Name=group-name,Values=${sg_name}" "Name=vpc-id,Values=${vpc_id}" \
         --query "SecurityGroups[0].GroupId" \
-        --output text 2>/dev/null | tr -d '\r\n' | xargs || echo "")
+        --output text 2>/dev/null || echo "")
+    
+    # Clean the SG ID - remove ALL whitespace and control characters
+    sg_id=$(echo "${sg_id}" | tr -d '[:space:]' | tr -d '\r\n')
     
     # Handle "None" response
     if [[ "${sg_id}" == "None" ]] || [[ -z "${sg_id}" ]]; then
@@ -124,13 +127,13 @@ add_ingress_rule() {
     
     log_debug "Adding ingress rule: port ${port}/${protocol} from ${cidr}"
     
-    if has_ingress_rule "${sg_id}" "${port}"; then
-        log_info "Port ${port} ingress rule already exists"
+    if is_dry_run; then
+        log_info "[DRY RUN] Would check/add ingress: port ${port}/${protocol} from ${cidr}"
         return 0
     fi
     
-    if is_dry_run; then
-        log_info "[DRY RUN] Would add ingress: port ${port}/${protocol} from ${cidr}"
+    if has_ingress_rule "${sg_id}" "${port}"; then
+        log_info "Port ${port} ingress rule already exists"
         return 0
     fi
     
@@ -149,10 +152,10 @@ create_security_group() {
     local description="$2"
     local vpc_id="$3"
     
-    log_info "Creating new security group: ${sg_name}"
+    log_info "Creating new security group: ${sg_name}" >&2
     
     if is_dry_run; then
-        log_info "[DRY RUN] Would create security group: ${sg_name}"
+        log_info "[DRY RUN] Would create security group: ${sg_name}" >&2
         echo "sg-dryrun12345"
         return 0
     fi
@@ -163,25 +166,35 @@ create_security_group() {
         --description "${description}" \
         --vpc-id "${vpc_id}" \
         --query "GroupId" \
-        --output text | tr -d '\r\n' | xargs)
+        --output text 2>/dev/null)
+    
+    # Clean the SG ID - remove ALL whitespace and control characters
+    sg_id=$(echo "${sg_id}" | tr -d '[:space:]' | tr -d '\r\n')
     
     if [[ -z "${sg_id}" ]]; then
-        log_error "Failed to create security group"
+        log_error "Failed to create security group" >&2
         return 1
     fi
     
-    log_success "Created security group: ${sg_id}"
+    log_success "Created security group: ${sg_id}" >&2
     
-    # Apply project tags
-    log_debug "Applying tags: ${TAG_KEY}=${PROJECT_TAG}"
-    apply_tags "${sg_id}" "ec2"
+    # Apply project tags (redirect output to stderr)
+    if ! is_dry_run; then
+        log_debug "Applying tags: ${TAG_KEY}=${PROJECT_TAG}" >&2
+        apply_tags "${sg_id}" "ec2" >/dev/null 2>&1
+    fi
     
+    # Output ONLY the clean SG ID to stdout
     echo "${sg_id}"
 }
 
 # Display security group information
 display_sg_info() {
     local sg_id="$1"
+    
+    if is_dry_run; then
+        return 0
+    fi
     
     log_info "Retrieving security group details..."
     
@@ -249,6 +262,11 @@ main() {
         # Create new security group
         sg_id=$(create_security_group "${SG_NAME}" "${SG_DESC}" "${VPC_ID}") || exit 1
     fi
+    
+    # CRITICAL: Clean the SG ID to remove any whitespace/newlines
+    sg_id=$(echo "${sg_id}" | tr -d '[:space:]')
+    
+    log_debug "Using security group ID: [${sg_id}]"
     
     # Validate SG ID format
     if ! is_dry_run; then

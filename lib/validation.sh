@@ -255,7 +255,6 @@ validate_security_group_id() {
 
 # Common free-tier eligible instance types
 readonly FREE_TIER_INSTANCE_TYPES=(
-    "t2.micro"
     "t3.micro"
 )
 
