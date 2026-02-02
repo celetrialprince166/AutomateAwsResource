@@ -9,19 +9,19 @@ A robust, idempotent, and state-aware automation suite for provisioning AWS reso
 
 ---
 
-## 📖 Table of Contents
-- [Architecture](#-architecture)
-- [Prerequisites](#-prerequisites)
-- [Quick Start](#-quick-start)
-- [Key Features](#-key-features)
-- [S3 Remote State Backend](#-s3-remote-state-backend)
-- [Configuration](#-configuration)
-- [Project Structure](#-project-structure)
-- [Challenges & Solutions](#-challenges--solutions)
+## Table of Contents
+- [Architecture](#architecture)
+- [Prerequisites](#prerequisites)
+- [Quick Start](#quick-start)
+- [Key Features](#key-features)
+- [S3 Remote State Backend](#s3-remote-state-backend)
+- [Configuration](#configuration)
+- [Project Structure](#project-structure)
+- [Challenges & Solutions](#challenges--solutions)
 
 ---
 
-## 🏗 Architecture
+## Architecture
 
 This system uses an **Orchestrator Pattern** to manage dependencies and a **JSON State File** to track resources.
 
@@ -37,7 +37,7 @@ This system uses an **Orchestrator Pattern** to manage dependencies and a **JSON
 
 ---
 
-## 🛠 Prerequisites
+## Prerequisites
 
 Ensure you have the following installed:
 
@@ -58,7 +58,7 @@ chmod +x orchestrate.sh scripts/*.sh
 
 ---
 
-## 🚀 Quick Start
+## Quick Start
 
 The system is controlled via the `orchestrate.sh` entry point.
 
@@ -97,7 +97,7 @@ Reliably destroys resources in reverse dependency order (S3 -> EC2 -> SG).
 
 ---
 
-## 💎 Key Features
+## Key Features
 
 ### 1. Terraform-like State Management
 Unlike typical Bash scripts that "fire and forget," this project maintains a local state file (`.state/default.json`).
@@ -121,7 +121,7 @@ Logs are structured, timestamped, and color-coded.
 
 ---
 
-## ☁ S3 Remote State Backend
+## S3 Remote State Backend
 
 For team collaboration and disaster recovery, state can be stored in S3 instead of locally.
 
@@ -165,7 +165,7 @@ export STATE_BACKEND="s3"
 
 ---
 
-## ⚙ Configuration
+## Configuration
 
 All settings are centralized in `config.env`.
 
@@ -185,7 +185,7 @@ AWS_REGION=us-east-1 ./orchestrate.sh apply
 
 ---
 
-## 📂 Project Structure
+## Project Structure
 
 ```text
 .
@@ -207,7 +207,7 @@ AWS_REGION=us-east-1 ./orchestrate.sh apply
 
 ---
 
-## 🔧 Challenges & Solutions
+## Challenges & Solutions
 
 During development, several challenges were encountered and resolved:
 
@@ -221,7 +221,7 @@ During development, several challenges were encountered and resolved:
 
 ---
 
-## 🤝 Contributing
+## Contributing
 
 1. Fork the repository
 2. Create a feature branch (`git checkout -b feature/amazing-feature`)
@@ -231,13 +231,13 @@ During development, several challenges were encountered and resolved:
 
 ---
 
-## 📝 License
+## License
 
 This project is part of the DevOps Automation Lab. Licensed under MIT.
 
 ---
 
-## 👤 Author
+## Author
 
 **Prince Tetteh Ayiku**
 
